@@ -132,7 +132,7 @@ def install_embed_benchmark():
     """Monkey-patch eval/download.py to accept benchmark='embed' (or 'custom'
     when EMBED_ENABLE=1 is set, since the upstream argparse rejects 'embed').
     """
-    from LDM_correspondences.eval import download
+    from eval import download
 
     original_load = download.load_dataset
 
@@ -181,7 +181,7 @@ def install_embed_benchmark():
 
 # Auto-install on import
 install_embed_benchmark()
-from auto_commit import commit_with_hf_message
+from scripts.auto_commit import commit_with_hf_message
 
 if __name__ == '__main__':
     # ------------------------------------------------------------------

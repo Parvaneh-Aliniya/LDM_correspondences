@@ -150,17 +150,26 @@ class MammogramLoader:
 
         arr = self._window(arr, ds)  # -> [0, 1] float32
 
-        # ---- 2. Laterality (for flip decision) -----------------------------
+        # ---- 2. Laterality (for the result struct; orientation handled below)
         if laterality is None:
             laterality = str(getattr(ds, 'ImageLaterality', 'L'))[:1].upper()
 
-        flipped = False
-        if self.flip_to_left and laterality == 'R':
-            arr = np.fliplr(arr).copy()
-            flipped = True
-
-        # ---- 3. Breast-region mask + optional crop -------------------------
+        # ---- 3. Breast-region mask + content-based orientation -------------
+        # Segment first so we can decide orientation from where the breast
+        # actually sits, not from the (sometimes unreliable) CSV laterality.
         breast_mask_full = self._segment_breast(arr)
+        flipped = False
+        if self.flip_to_left:
+            # If the breast is in the right half of the image, flip so the
+            # chest wall is on the left edge. This works for ALL DICOMs
+            # regardless of whether they were pre-standardized or saved raw.
+            ys, xs = np.where(breast_mask_full)
+            if len(xs) > 0:
+                breast_centroid_x = xs.mean()
+                if breast_centroid_x > arr.shape[1] / 2:
+                    arr = np.fliplr(arr).copy()
+                    breast_mask_full = np.fliplr(breast_mask_full).copy()
+                    flipped = True
 
         if self.crop_to_breast:
             arr, breast_mask_full, crop_box = self._crop_to_mask(
@@ -239,43 +248,93 @@ class MammogramLoader:
         """
         Coarse segmentation of breast tissue vs background.
 
-        Approach: Otsu threshold on a blurred image, then keep the largest
-        connected component touching the left edge of the image. Works
-        because (a) mammogram background is near-black and tissue is bright,
-        (b) the breast always touches one image edge (the chest wall side).
-
-        Assumes the image has already been left-flipped if it was a right
-        breast — so chest wall is on the LEFT.
+        Approach:
+          1. Otsu threshold on a blurred image (mammogram background is
+             near-black, tissue is bright)
+          2. Keep the largest connected component that touches ANY image edge
+             (the breast always touches the chest-wall edge; we don't assume
+             which side because some data is pre-standardized and some isn't)
+          3. Large morphological closing to bridge speckled tissue regions
+          4. Flood-fill from background corners to fill any remaining
+             interior holes (so the mask is the breast OUTLINE filled solid,
+             not Otsu's noisy threshold)
         """
         cv2 = _require_cv2()
+        h, w = arr01.shape
         u8 = (arr01 * 255).astype(np.uint8)
         blur = cv2.GaussianBlur(u8, (15, 15), 0)
         _, thresh = cv2.threshold(
             blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
         )
+
+        # Aggressive closing BEFORE picking the connected component, so thin
+        # regions like the nipple tip stay connected to the main breast blob
+        # instead of being dropped as separate small components.
+        k_size = max(31, (min(h, w) // 30) | 1)   # odd, at least 31
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
         # Connected components
         num, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, 8)
         if num <= 1:
             return np.ones_like(thresh, dtype=bool)
-        # Find largest component that touches the LEFT edge (col 0)
-        h, w = thresh.shape
+
+        # Pick the largest component that touches ANY image edge.
+        # This is more robust than assuming left-only — works for both
+        # pre-standardized (chest wall already on left) and raw DICOMs.
         best_label, best_area = 0, 0
         for lbl in range(1, num):
             area = stats[lbl, cv2.CC_STAT_AREA]
             left = stats[lbl, cv2.CC_STAT_LEFT]
-            if left == 0 and area > best_area:
+            top = stats[lbl, cv2.CC_STAT_TOP]
+            width = stats[lbl, cv2.CC_STAT_WIDTH]
+            height = stats[lbl, cv2.CC_STAT_HEIGHT]
+            touches_edge = (
+                left == 0                            # touches left edge
+                or top == 0                          # touches top
+                or (left + width) >= w               # touches right
+                or (top + height) >= h               # touches bottom
+            )
+            if touches_edge and area > best_area:
                 best_area = area
                 best_label = lbl
+
         if best_label == 0:
-            # No component touches left edge — fall back to largest overall
+            # Nothing touched an edge — fall back to largest overall
             areas = stats[1:, cv2.CC_STAT_AREA]
             best_label = 1 + int(np.argmax(areas))
-        mask = (labels == best_label)
-        # Small morphological close to fill internal holes
-        mask_u8 = mask.astype(np.uint8) * 255
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
-        return mask_u8.astype(bool)
+
+        mask = (labels == best_label).astype(np.uint8) * 255
+
+        # Flood-fill from corners to fill interior holes (Otsu-dropped tissue
+        # in the middle of the breast, e.g. fatty regions). "The breast is
+        # the area NOT reachable from outside via background pixels."
+        h2, w2 = mask.shape
+        flood = mask.copy()
+        ff_mask = np.zeros((h2 + 2, w2 + 2), np.uint8)
+        for corner in [(0, 0), (0, w2 - 1), (h2 - 1, 0), (h2 - 1, w2 - 1)]:
+            if flood[corner] == 0:
+                cv2.floodFill(flood, ff_mask, (corner[1], corner[0]), 255)
+        holes = cv2.bitwise_not(flood)
+        mask = cv2.bitwise_or(mask, holes)
+
+        # Convex-hull pass: fill "bites" out of the silhouette (e.g. the
+        # nipple region, where tissue thins and Otsu drops the threshold).
+        # The breast in a CC/MLO view is roughly convex; we exploit that.
+        # We only ADD pixels to the mask — never remove — so this is safe
+        # even when the breast happens to be slightly non-convex.
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+        )
+        if contours:
+            # The breast is the biggest contour
+            biggest = max(contours, key=cv2.contourArea)
+            hull = cv2.convexHull(biggest)
+            hull_mask = np.zeros_like(mask)
+            cv2.fillPoly(hull_mask, [hull], 255)
+            mask = cv2.bitwise_or(mask, hull_mask)
+
+        return mask.astype(bool)
 
     @staticmethod
     def _crop_to_mask(
@@ -357,3 +416,44 @@ class MammogramLoader:
         hom = np.concatenate([pts, ones], axis=1)         # (N, 3)
         out = (affine @ hom.T).T                          # (N, 3)
         return out[:, :2]
+
+    @staticmethod
+    def load_raw_for_display(dicom_path: str | Path) -> np.ndarray:
+        """Load a DICOM with minimal processing — for human visualization only.
+
+        Does:
+          1. read pixel array
+          2. apply VOI LUT if available (radiologist-intended window/level)
+          3. invert if MONOCHROME1
+
+        Does NOT:
+          - resize, crop, flip, segment, replicate to 3 channels
+
+        Returns a (H, W) float32 array in [0, 1] at the original resolution.
+        Use this to compare "what the radiologist sees" against the
+        preprocessed view that goes into the model.
+        """
+        pydicom = _require_pydicom()
+        dicom_path = Path(dicom_path)
+        if not dicom_path.is_file():
+            raise FileNotFoundError(f"DICOM not found: {dicom_path}")
+        ds = pydicom.dcmread(str(dicom_path))
+        arr = ds.pixel_array.astype(np.float32)
+
+        # VOI LUT if available
+        try:
+            from pydicom.pixel_data_handlers.util import apply_voi_lut
+            arr_w = apply_voi_lut(arr.astype(np.uint16, copy=False), ds)
+            arr = arr_w.astype(np.float32)
+        except Exception:
+            pass
+
+        # MONOCHROME1 → invert
+        if str(getattr(ds, 'PhotometricInterpretation', '')) == 'MONOCHROME1':
+            arr = arr.max() - arr
+
+        # Normalize to [0, 1]
+        lo, hi = arr.min(), arr.max()
+        if hi > lo:
+            arr = (arr - lo) / (hi - lo)
+        return arr.astype(np.float32)
